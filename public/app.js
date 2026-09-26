@@ -2239,7 +2239,7 @@ function renderBusyResult(result) {
   // 已知峰值：达到峰值的窗口起点段
   const peakRanges = result.peak.segments.map(busyStartRangeText).join('、');
   els.busyPeak.innerHTML =
-    `已知峰值：各起点半开窗口内确定由「${esc(result.person)}」参与的交接次数最多为 ` +
+    `已知峰值：各起点半开窗口内完整确定、确定由「${esc(result.person)}」参与的交接次数最多为 ` +
     `<strong>${result.peak.count}</strong> 次` +
     (result.peak.segments.length ? `（出现于起点 ${esc(peakRanges)}）` : '') +
     (result.involvedRecords.length
@@ -2267,7 +2267,7 @@ function renderBusyResult(result) {
     els.busyUnd.innerHTML = '';
   } else {
     els.busyUnd.innerHTML = `
-      <div class="resp-und-head">？ 无法判定（${result.undeterminedSegments.length} 段）：已知交接次数未超上限，但窗口末端到达冲突分钟及以后，冲突后的记录无法确认（不把冲突后的记录当作零）</div>
+      <div class="resp-und-head">？ 无法判定（${result.undeterminedSegments.length} 段）：已知交接次数未超上限，但窗口覆盖冲突分钟及以后，冲突分钟（含同分钟先可接续后冲突的部分记录）及以后的记录无法确认（不当作零）</div>
       <div class="table-wrap">
         <table class="table">
           <thead><tr><th>窗口起点段</th><th>覆盖分钟</th><th>已知次数（最高）</th><th>冲突道具</th><th>说明</th></tr></thead>
@@ -2288,7 +2288,7 @@ function renderBusyResult(result) {
     els.busyConflicts.innerHTML = '';
   } else {
     els.busyConflicts.innerHTML = `
-      <div class="resp-section-title">排查范围内发生链冲突的道具（冲突前已确认的记录继续计入，冲突后的记录无法确认）</div>
+      <div class="resp-section-title">排查范围内发生链冲突的道具（只计早于首个冲突分钟的完整确定记录；同分钟先有可接续交接、随后才冲突的部分记录不计入）</div>
       <div class="table-wrap">
         <table class="table">
           <thead><tr><th>道具</th><th>冲突分钟</th><th>冲突类型</th><th>说明</th></tr></thead>

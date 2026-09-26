@@ -10,11 +10,14 @@
  * - 逐件沿现有「同分钟唯一交接链」重放：只取最后一个窗口覆盖分钟（含）
  *   以前的记录（更晚的记录与冲突不参与）；同分钟链式交接按实际可接续记录
  *   逐条计数（如 仓库→张三、张三→李四 同分钟各计一次），与录入顺序无关。
- * - 冲突前已确认的记录继续计入：链上记录（冲突分钟之前的已确认前缀）
- *   照常计入已知次数；冲突分钟及以后的记录不计入已知，也不当作零。
+ * - 以「完整确定的分钟」为计数边界：一件道具在某分钟先有可接续交接、随后
+ *   才发生歧义 / 断链时，该分钟并非完整确定——该分钟归约出的部分链记录
+ *   一律不计入已知（只计早于首个冲突分钟的记录），冲突分钟及以后既不计入
+ *   已知，也不当作零；无冲突道具的同分钟链仍按每条交接计数。
  * - 窗口末端到达冲突分钟及以后（窗口覆盖冲突分钟或更晚，即 s+窗口长度 > 冲突分钟）
- *   时该窗口受冲突影响：已知次数超过上限仍判「确定超限」（未知不会使
- *   已超的次数变少），否则标为「无法判定」（不把冲突后的记录当作零）。
+ *   时该窗口受冲突影响：其他道具的已知次数（及冲突道具早于冲突分钟的记录）
+ *   之和已严格超过上限仍判「确定超限」（未知不会使已超的次数变少），
+ *   否则标为「无法判定」（不把冲突分钟及以后的记录当作零）。
  * - 相邻同结论的窗口起点合并为起点段；返回已知峰值（各起点已知次数的
  *   最大值及达到峰值的起点段）、确定超限段涉及的记录与冲突道具清单。
  *
@@ -74,8 +77,11 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
   // 只重放该分钟（含）以前的记录，更晚的交接与冲突不影响本次排查
   const cutoffMinute = endMinute + windowLength - 1;
 
-  // 逐件沿同分钟唯一交接链重放：链上记录即冲突前已确认的记录
-  const confirmed = []; // 该人员参与的已确认链上记录（作为交出者或接收者）
+  // 逐件沿同分钟唯一交接链重放。计数边界是「完整确定的分钟」：
+  // 冲突道具只把早于首个冲突分钟的链记录计入已知——同分钟内先归约出部分
+  // 交接、随后才发现歧义 / 断链时，该分钟并不完整确定，其部分链记录也不计入
+  // （仅凭未完成的链不能计为已知）；无冲突道具的全部链记录（含同分钟链）照常计入。
+  const confirmed = []; // 该人员参与的完整确定分钟内的链记录（作为交出者或接收者）
   const conflicts = [];
 
   for (const prop of props) {
@@ -84,7 +90,11 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
     );
     const replay = replayPropRecords(propRecords);
 
+    // 冲突分钟是「首个不完整确定的分钟」：只有严格早于它的链记录才计入已知
+    const conflictMinute = replay.ok ? null : replay.conflict.minute;
+
     for (const rec of replay.chain) {
+      if (conflictMinute !== null && rec.minute >= conflictMinute) continue;
       if (rec.from === person || rec.to === person) {
         confirmed.push({
           id: rec.id,
@@ -117,6 +127,7 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
   // 事件扫描（不按跨度存储窗口、不展开起点数组）：
   // - 第 m 分钟的已确认记录被窗口 [s, s+W) 覆盖 ⇔ s ≤ m < s+W ⇔ s ∈ [m-W+1, m]：
   //   起点到达进入点时已知次数 +1，离开覆盖区间的下一个起点时 -1；
+  //   （冲突道具的计数只含严格早于冲突分钟的完整确定记录，故 m 不会落在冲突分钟）
   // - 第 c 分钟的冲突被窗口末端触达 ⇔ s+W > c ⇔ s ≥ c-W+1：起点越过该阈值后
   //   触达冲突数 +1（触达集合随 s 单调不减，无需离开事件）。
   // 事件只与记录 / 冲突数量有关，与起点跨度无关。
@@ -242,7 +253,8 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
           `窗口起点${startRangeText(seg)}的每个半开窗口内，已知确定交接次数均超过上限 ` +
           `${limit} 次（段内最高 ${segPeak} 次）` +
           (segConflicts.length
-            ? `；另有 ${conflictNames} 起交接链冲突，冲突后的记录无法确认，实际次数可能更多`
+            ? `；另有 ${conflictNames} 起交接链冲突，冲突分钟及以后的记录无法确认` +
+              '（同分钟先有可接续交接、随后才冲突的部分记录也不计入），实际次数可能更多'
             : '') +
           '。',
       });
@@ -257,7 +269,8 @@ function investigateBusyWindow(data, person, startMinute, endMinute, windowLengt
         note:
           `窗口起点${startRangeText(seg)}的半开窗口内，已知交接次数最高 ${segPeak} 次` +
           `（未超过上限 ${limit} 次），但 ${conflictNames} 起交接链冲突——` +
-          '窗口末端到达冲突分钟及以后，冲突后的记录无法确认（不把冲突后的记录当作零），' +
+          '窗口末端到达冲突分钟及以后，冲突分钟及以后的记录无法确认' +
+          '（同分钟先有可接续交接、随后才冲突的部分记录也不计入，不把这些记录当作零），' +
           '无法判定是否超限。',
       });
     }

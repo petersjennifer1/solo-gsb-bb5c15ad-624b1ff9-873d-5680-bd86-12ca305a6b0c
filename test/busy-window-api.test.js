@@ -155,7 +155,84 @@ async function main() {
     assert.strictEqual(r.peak.count, 1);
   });
 
-  // 5. 窗口覆盖范围之外的更晚冲突不影响结果
+  // 5. 同分钟内先有可接续交接、随后才发生歧义 / 断链：该分钟不是完整确定的分钟，
+  //    归约出的部分链记录不计入已知——不能仅凭未完成的链判确定超限 / 虚高峰值
+  await test('忙时排查：同分钟先可接续后冲突，该分钟部分记录不计已知（无法判定）', async () => {
+    const prop1 = (await api('/api/props', {
+      method: 'POST',
+      body: JSON.stringify({ name: '忙时歧义扇' }),
+    })).body;
+    // 第 8 分：仓库→忙测员（先唯一归约），随后忙测员→甲、忙测员→乙 两条可接续 => 歧义@8
+    for (const [from, to] of [['仓库', '忙测员'], ['忙测员', '甲'], ['忙测员', '乙']]) {
+      const add = await api('/api/records', {
+        method: 'POST',
+        body: JSON.stringify({ propId: prop1.id, minute: 8, from, to }),
+      });
+      assert.strictEqual(add.status, 201);
+    }
+
+    const r = (await api('/api/busy-window?person=忙测员&start=8&end=8&window=1&limit=0')).body;
+    // 旧实现把「仓库→忙测员」计为已知 => 虚高确定超限 1 次；修复后整分钟不计 => 无法判定
+    assert.strictEqual(r.overSegments.length, 0);
+    assert.strictEqual(r.undeterminedSegments.length, 1);
+    assert.deepStrictEqual(
+      [r.undeterminedSegments[0].firstStart, r.undeterminedSegments[0].lastStart],
+      [8, 8]
+    );
+    assert.strictEqual(r.undeterminedSegments[0].maxKnownCount, 0);
+    // 截止覆盖分钟 8 也包含演示数据的宫灯@4、折扇@5 冲突；新增歧义扇@8 按分钟排在最后
+    assert.deepStrictEqual(
+      r.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]).slice(-1)[0],
+      ['忙时歧义扇', 8, 'AMBIGUOUS']
+    );
+    assert.strictEqual(r.peak.count, 0);
+    assert.strictEqual(r.involvedRecords.length, 0);
+    assert.strictEqual(r.summary.hasOver, false);
+
+    // 另一件道具同分钟链式交接后断链，该分钟的部分链记录同样不计入
+    const prop2 = (await api('/api/props', {
+      method: 'POST',
+      body: JSON.stringify({ name: '忙时断链灯' }),
+    })).body;
+    for (const [from, to] of [['仓库', '忙测员'], ['忙测员', '丙'], ['丁', '戊']]) {
+      const add = await api('/api/records', {
+        method: 'POST',
+        body: JSON.stringify({ propId: prop2.id, minute: 9, from, to }),
+      });
+      assert.strictEqual(add.status, 201);
+    }
+    const r2 = (await api('/api/busy-window?person=忙测员&start=9&end=9&window=1&limit=1')).body;
+    assert.strictEqual(r2.overSegments.length, 0);
+    assert.strictEqual(r2.undeterminedSegments.length, 1);
+    assert.strictEqual(r2.undeterminedSegments[0].maxKnownCount, 0);
+    // 窗口 [9,10) 末端同时越过演示数据的宫灯@4、折扇@5 冲突，一并按冲突分钟排序列出
+    assert.deepStrictEqual(
+      r2.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]).slice(-1)[0],
+      ['忙时断链灯', 9, 'BROKEN']
+    );
+    assert.ok(r2.conflicts.some((c) => c.propName === '宫灯' && c.conflictMinute === 4));
+    assert.ok(r2.conflicts.some((c) => c.propName === '折扇' && c.conflictMinute === 5));
+    assert.strictEqual(r2.peak.count, 0);
+
+    // 无冲突的同分钟链仍按每条交接计数：另一件道具第 10 分 仓库→忙测员→丙 计 2 次
+    const prop3 = (await api('/api/props', {
+      method: 'POST',
+      body: JSON.stringify({ name: '忙时正常剑' }),
+    })).body;
+    for (const [from, to] of [['仓库', '忙测员'], ['忙测员', '丙']]) {
+      const add = await api('/api/records', {
+        method: 'POST',
+        body: JSON.stringify({ propId: prop3.id, minute: 10, from, to }),
+      });
+      assert.strictEqual(add.status, 201);
+    }
+    const r3 = (await api('/api/busy-window?person=忙测员&start=10&end=10&window=1&limit=1')).body;
+    assert.strictEqual(r3.overSegments.length, 1);
+    assert.strictEqual(r3.overSegments[0].peakKnownCount, 2);
+    assert.strictEqual(r3.peak.count, 2);
+  });
+
+  // 6. 窗口覆盖范围之外的更晚冲突不影响结果
   await test('忙时排查：窗口覆盖范围之外的更晚冲突不影响结果', async () => {
     // 最后一个窗口 [2,4)：只重放第 3 分钟及以前的记录，宫灯@4、折扇@5 的冲突不参与
     const r = (await api('/api/busy-window?person=张三&start=0&end=2&window=2&limit=0')).body;
@@ -168,7 +245,7 @@ async function main() {
     );
   });
 
-  // 6. 大跨度查询不逐起点存储/展开窗口：道具第 150000 分钟交给新人员，
+  // 7. 大跨度查询不逐起点存储/展开窗口：道具第 150000 分钟交给新人员，
   //    起点 0～150000、窗口 150001、上限 0 应正常返回一个确定超限段（峰值 1）
   await test('忙时排查：大跨度查询不展开参数，返回确定超限段', async () => {
     const prop = (await api('/api/props', {
@@ -195,7 +272,7 @@ async function main() {
     assert.strictEqual(r.summary.windowCount, 150001);
   });
 
-  // 7. 只读：查询不改写数据（版本号与记录数不变）
+  // 8. 只读：查询不改写数据（版本号与记录数不变）
   await test('忙时排查：查询只读，数据版本与记录数不变', async () => {
     const before = (await api('/api/state')).body;
     await api('/api/busy-window?person=张三&start=0&end=12&window=3&limit=1');
@@ -206,7 +283,7 @@ async function main() {
     assert.strictEqual(after.records.length, before.records.length);
   });
 
-  // 8. 参数校验：缺参数 / 负数 / 小数 / 起止颠倒 / 窗口长度不足 1 均 400
+  // 9. 参数校验：缺参数 / 负数 / 小数 / 起止颠倒 / 窗口长度不足 1 均 400
   await test('忙时排查：参数校验 400', async () => {
     let res = await api('/api/busy-window?start=0&end=12&window=3&limit=1');
     assert.strictEqual(res.status, 400);

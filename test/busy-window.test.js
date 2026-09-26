@@ -220,6 +220,128 @@ test('忙时排查：窗口覆盖范围之外的更晚冲突不影响结果', ()
   );
 });
 
+// 7. 同分钟内先有可接续交接、随后才发生歧义：该分钟不是完整确定的分钟，
+//    归约出的部分链记录不计入已知——不能仅凭未完成的链判确定超限 / 虚高峰值
+test('忙时排查：同分钟先可接续后歧义，该分钟部分记录不计已知（判无法判定）', () => {
+  // 第 5 分钟：仓库→张三（唯一可接续，先执行），随后张三→李四、张三→王五 两条可接续 => 歧义@5
+  const data = mkData(['扇'], [
+    rec('p0', 5, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'),
+    rec('p0', 5, '张三', '王五'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 5, 5, 1, 0);
+  // 窗口 [5,6) 覆盖冲突分钟：该分钟的「仓库→张三」也不计入已知 => 已知 0，不超上限，无法判定
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  const u = r.undeterminedSegments[0];
+  assert.deepStrictEqual([u.firstStart, u.lastStart, u.maxKnownCount], [5, 5, 0]);
+  assert.deepStrictEqual(
+    u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['扇', 5, 'AMBIGUOUS']]
+  );
+  // 峰值、涉及记录都不得被该分钟的部分链记录虚高
+  assert.strictEqual(r.peak.count, 0);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 5, lastStart: 5 }]);
+  assert.strictEqual(r.involvedRecords.length, 0);
+
+  // 倒序录入（歧义记录在前）结果一致：与录入顺序无关
+  seq = 0;
+  const data2 = mkData(['扇'], [
+    rec('p0', 5, '张三', '王五'),
+    rec('p0', 5, '张三', '李四'),
+    rec('p0', 5, WAREHOUSE, '张三'),
+  ]);
+  const r2 = investigateBusyWindow(data2, '张三', 5, 5, 1, 0);
+  assert.strictEqual(r2.overSegments.length, 0);
+  assert.strictEqual(r2.undeterminedSegments.length, 1);
+  assert.strictEqual(r2.peak.count, 0);
+});
+
+// 7b. 同分钟链式交接后断链：该分钟先归约出的链记录同样不计入已知
+test('忙时排查：同分钟先链式交接后断链，该分钟部分记录不计已知', () => {
+  // 第 5 分钟：仓库→张三、张三→李四 可归约，随后剩 赵六→钱七（当前为李四）无法接续 => 断链@5
+  const data = mkData(['灯'], [
+    rec('p0', 5, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'),
+    rec('p0', 5, '赵六', '钱七'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 5, 5, 1, 1);
+  // 旧实现把「接收 1 次 + 交出 1 次 = 2 次」计为已知 => 虚高确定超限；修复后该分钟整分钟不计
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  assert.strictEqual(r.undeterminedSegments[0].maxKnownCount, 0);
+  assert.deepStrictEqual(
+    r.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['灯', 5, 'BROKEN']]
+  );
+  assert.strictEqual(r.peak.count, 0);
+  assert.strictEqual(r.involvedRecords.length, 0);
+});
+
+// 7c. 冲突分钟的部分记录不计入，但其他道具与更早分钟的已知记录照常计入：
+//     已知次数仍严格超过上限时判确定超限（段内只列完整确定的记录），否则无法判定
+test('忙时排查：冲突分钟部分记录剔除后，其他已知仍超上限判确定超限并标注冲突', () => {
+  const data = mkData(['剑', '扇'], [
+    rec('p0', 5, WAREHOUSE, '张三'), // 剑：无冲突，第 5 分正常交接，计入
+    rec('p0', 5, '张三', '李四'),   // 剑：同分钟链式，张三交出，同样计入
+    rec('p1', 1, WAREHOUSE, '张三'), // 扇：冲突分钟之前的已确认记录
+    rec('p1', 5, WAREHOUSE, '张三'),
+    rec('p1', 5, '张三', '李四'),
+    rec('p1', 5, '张三', '王五'),   // 扇：第 5 分先可接续后歧义，该分钟两条均不计
+  ]);
+  // 窗口 [5,6) 覆盖冲突分钟 5：已知只有剑在第 5 分的 2 条链（扇第 5 分两条均剔除）
+  const r = investigateBusyWindow(data, '张三', 5, 5, 1, 1);
+  assert.strictEqual(r.overSegments.length, 1);
+  const seg = r.overSegments[0];
+  assert.deepStrictEqual([seg.firstStart, seg.lastStart, seg.peakKnownCount], [5, 5, 2]);
+  assert.deepStrictEqual(
+    seg.records.map((x) => [x.propName, x.minute]),
+    [['剑', 5], ['剑', 5]]
+  );
+  assert.deepStrictEqual(
+    seg.conflicts.map((c) => [c.propName, c.conflictMinute]),
+    [['扇', 5]]
+  );
+  assert.strictEqual(r.peak.count, 2);
+  assert.strictEqual(r.involvedRecords.length, 2);
+
+  // 上限提到 2：已知 2 次等于上限不超限，窗口又覆盖冲突分钟 => 无法判定
+  const r2 = investigateBusyWindow(data, '张三', 5, 5, 1, 2);
+  assert.strictEqual(r2.overSegments.length, 0);
+  assert.strictEqual(r2.undeterminedSegments.length, 1);
+  assert.strictEqual(r2.undeterminedSegments[0].maxKnownCount, 2);
+
+  // 冲突道具更早分钟的记录在覆盖它的窗口里照常计入：窗口 [1,6) 已知 = 扇@1 + 剑@5×2 = 3
+  const r3 = investigateBusyWindow(data, '张三', 1, 1, 5, 2);
+  assert.strictEqual(r3.overSegments.length, 1);
+  assert.strictEqual(r3.overSegments[0].peakKnownCount, 3);
+  assert.deepStrictEqual(
+    r3.overSegments[0].records.map((x) => [x.propName, x.minute, x.role]),
+    [['扇', 1, 'to'], ['剑', 5, 'to'], ['剑', 5, 'from']]
+  );
+});
+
+// 7d. 半开窗口边界：窗口末端恰为冲突分钟（[s, s+W) 不含该分钟）时不触及冲突，
+//     该分钟的记录也不在窗口内；起点再进 1 分钟覆盖冲突分钟后才标冲突且该分钟不计已知
+test('忙时排查：窗口末端恰为冲突分钟不触及，覆盖后才标冲突（同分钟记录剔除）', () => {
+  const data = mkData(['扇'], [
+    rec('p0', 5, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'),
+    rec('p0', 5, '张三', '王五'),
+  ]);
+  const r = investigateBusyWindow(data, '张三', 4, 6, 1, 0);
+  // s=4 [4,5)：不含第 5 分，已知 0，未触及冲突 => OK
+  // s=5 [5,6)：覆盖冲突分钟 5，部分记录不计 => 无法判定
+  // s=6 [6,7)：窗口已越过冲突分钟（末端 7 > 5），同样无法判定
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.undeterminedSegments[0].firstStart, r.undeterminedSegments[0].lastStart],
+    [5, 6]
+  );
+  assert.strictEqual(r.peak.count, 0);
+});
+
 // 8. 已知峰值：取各起点已知次数最大值，达到峰值的相邻起点分别合并
 test('忙时排查：已知峰值及达到峰值的多个起点段', () => {
   const data = mkData(['剑', '扇', '灯'], [
