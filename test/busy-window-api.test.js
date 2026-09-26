@@ -168,7 +168,63 @@ async function main() {
     );
   });
 
-  // 6. 大跨度查询不逐起点存储/展开窗口：道具第 150000 分钟交给新人员，
+  // 6. 同一分钟先有可接续交接、随后才歧义 / 断链：冲突当分钟不是完整确定的分钟，
+  //    即使该交接已在重放链上也不计入已知（修复前会凭未完成的链产生虚高峰 / 确定超限）
+  await test('忙时排查：同分钟先可接续后冲突，冲突当分钟记录不计入已知', async () => {
+    // 宫灯：仓库@2→王五；第4分 王五→钱七（先可接续）、钱七→仓库（再可接续）、
+    // 李四→赵六（剩余记录无法接续）-> 断链@4。修复前王五会被计 @2 接收 + @4 交出共 2 次。
+    await api('/api/records', {
+      method: 'POST',
+      body: JSON.stringify({ propId: 'p_lantern', minute: 4, from: '王五', to: '钱七', note: '' }),
+    });
+    await api('/api/records', {
+      method: 'POST',
+      body: JSON.stringify({ propId: 'p_lantern', minute: 4, from: '钱七', to: '仓库', note: '' }),
+    });
+    const addBroken = await api('/api/records', {
+      method: 'POST',
+      body: JSON.stringify({ propId: 'p_lantern', minute: 4, from: '李四', to: '赵六', note: '' }),
+    });
+    assert.strictEqual(addBroken.status, 201);
+
+    const r = (await api('/api/busy-window?person=王五&start=0&end=5&window=3&limit=1')).body;
+    // 已知只计严格早于冲突分钟 4 的记录：王五仅宫灯@2 接收 1 次（等于上限，不判超限）
+    // s=0 [0,3):{2}=1 OK；s=1 [1,4):{2}=1 OK（末端 4 不含冲突分钟）；
+    // s=2 [2,5):{2}=1 但覆盖宫灯冲突分钟 4 -> 无法判定；s=3..5 已知 0、覆盖宫灯@4
+    // 及折扇@5 冲突 -> 无法判定（段内并集同时标注两件冲突道具）
+    assert.strictEqual(r.overSegments.length, 0);
+    assert.strictEqual(r.undeterminedSegments.length, 1);
+    const u = r.undeterminedSegments[0];
+    assert.deepStrictEqual([u.firstStart, u.lastStart, u.maxKnownCount], [2, 5, 1]);
+    assert.deepStrictEqual(
+      u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+      [['宫灯', 4, 'BROKEN'], ['折扇', 5, 'AMBIGUOUS']]
+    );
+    // 峰值只来自完整确定的分钟（@2），不含冲突当分钟已归约出的 @4 交出；
+    // 峰值段只按次数相邻相等合并，可跨越 OK 与无法判定段（起点 0–2 已知均为 1）
+    assert.strictEqual(r.peak.count, 1);
+    assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 2 }]);
+    assert.strictEqual(r.involvedRecords.length, 0);
+    assert.strictEqual(r.summary.hasOver, false);
+
+    // 缩小重放范围（cutoff=4）后折扇@5 不参与：无法判定段只剩宫灯@4，
+    // 且起点 4、5 的窗口末端为 7、8 > 4，同样覆盖宫灯冲突分钟 -> 无法判定
+    const r2 = (await api('/api/busy-window?person=王五&start=0&end=2&window=3&limit=1')).body;
+    assert.strictEqual(r2.overSegments.length, 0);
+    assert.strictEqual(r2.undeterminedSegments.length, 1);
+    assert.deepStrictEqual(
+      [r2.undeterminedSegments[0].firstStart, r2.undeterminedSegments[0].lastStart],
+      [2, 2]
+    );
+    assert.deepStrictEqual(
+      r2.undeterminedSegments[0].conflicts.map((c) => [c.propName, c.conflictMinute]),
+      [['宫灯', 4]]
+    );
+    assert.strictEqual(r2.peak.count, 1);
+    assert.deepStrictEqual(r2.peak.segments, [{ firstStart: 0, lastStart: 2 }]);
+  });
+
+  // 7. 大跨度查询不逐起点存储/展开窗口：道具第 150000 分钟交给新人员，
   //    起点 0～150000、窗口 150001、上限 0 应正常返回一个确定超限段（峰值 1）
   await test('忙时排查：大跨度查询不展开参数，返回确定超限段', async () => {
     const prop = (await api('/api/props', {

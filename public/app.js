@@ -2267,7 +2267,7 @@ function renderBusyResult(result) {
     els.busyUnd.innerHTML = '';
   } else {
     els.busyUnd.innerHTML = `
-      <div class="resp-und-head">？ 无法判定（${result.undeterminedSegments.length} 段）：已知交接次数未超上限，但窗口末端到达冲突分钟及以后，冲突后的记录无法确认（不把冲突后的记录当作零）</div>
+      <div class="resp-und-head">？ 无法判定（${result.undeterminedSegments.length} 段）：已知交接次数未超上限，但窗口覆盖冲突分钟或更晚，冲突分钟及以后的记录无法确认（不计入已知，也不当作零）</div>
       <div class="table-wrap">
         <table class="table">
           <thead><tr><th>窗口起点段</th><th>覆盖分钟</th><th>已知次数（最高）</th><th>冲突道具</th><th>说明</th></tr></thead>
@@ -2288,7 +2288,7 @@ function renderBusyResult(result) {
     els.busyConflicts.innerHTML = '';
   } else {
     els.busyConflicts.innerHTML = `
-      <div class="resp-section-title">排查范围内发生链冲突的道具（冲突前已确认的记录继续计入，冲突后的记录无法确认）</div>
+      <div class="resp-section-title">排查范围内发生链冲突的道具（只计早于首个冲突分钟的记录；同一分钟先有可接续交接、随后才歧义 / 断链时，冲突当分钟及以后均不计入已知）</div>
       <div class="table-wrap">
         <table class="table">
           <thead><tr><th>道具</th><th>冲突分钟</th><th>冲突类型</th><th>说明</th></tr></thead>

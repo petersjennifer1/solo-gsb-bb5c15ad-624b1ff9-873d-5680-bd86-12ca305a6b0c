@@ -358,4 +358,111 @@ test('忙时排查：大跨度查询冲突触达阈值按事件切段', () => {
   assert.strictEqual(r.summary.windowCount, 150001);
 });
 
+// 14. 同一分钟先有可接续交接、随后才歧义：冲突当分钟不是完整确定的分钟，
+//     已归约出的交接也不计入已知（修复前会凭未完成的链出现虚高峰 / 确定超限）
+test('忙时排查：同分钟先可接续后歧义，冲突当分钟记录不计入已知（虚高峰修复）', () => {
+  const data = mkData(['剑'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'), // 先可接续：张三 -> 李四
+    rec('p0', 5, '李四', '王五'), // 再可接续：李四 -> 王五
+    rec('p0', 5, '王五', '赵六'), // 此后同分钟两条可接续 -> 歧义在本分钟
+    rec('p0', 5, '王五', '钱七'),
+  ]);
+  // 上限 1：若把冲突分钟的 @5 链计入，张三在第5分有一次交出，窗口 [4,7) 会被误判超限
+  const r = investigateBusyWindow(data, '张三', 0, 6, 3, 1);
+  // 已知只计严格早于冲突分钟 5 的记录：张三仅第 1 分钟
+  // s=0 [0,3):{1}=1 等于上限 OK；s=1 [1,4):{1}=1 OK；s=2 [2,5):0 未覆盖冲突分钟 OK；
+  // s=3 [3,6):0 但覆盖冲突分钟 5 -> 无法判定（不因第5分的部分链判超限）
+  assert.strictEqual(r.overSegments.length, 0);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  const u = r.undeterminedSegments[0];
+  assert.deepStrictEqual([u.firstStart, u.lastStart, u.maxKnownCount], [3, 6, 0]);
+  assert.deepStrictEqual(
+    u.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['剑', 5, 'AMBIGUOUS']]
+  );
+  assert.strictEqual(r.conflicts.length, 1);
+  // 峰值只来自完整确定的分钟（第1分），不包含冲突当分钟的部分链
+  assert.strictEqual(r.peak.count, 1);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 1 }]);
+  assert.strictEqual(r.involvedRecords.length, 0);
+
+  // 无冲突的另一件道具把窗口已知次数抬过上限时，即使窗口覆盖冲突分钟仍确定超限
+  const data2 = mkData(['剑', '扇'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'), // 同分钟先可接续后歧义（见上）
+    rec('p0', 5, '李四', '王五'),
+    rec('p0', 5, '王五', '赵六'),
+    rec('p0', 5, '王五', '钱七'),
+    rec('p1', 4, WAREHOUSE, '张三'), // 完整确定：第4分仓库 -> 张三
+  ]);
+  const r2 = investigateBusyWindow(data2, '张三', 3, 3, 3, 1);
+  // s=3 [3,6)：已知仅扇@4 一条（剑@5 不计入）= 1 等于上限，不判超限 -> 无法判定
+  assert.strictEqual(r2.overSegments.length, 0);
+  assert.strictEqual(r2.undeterminedSegments.length, 1);
+  assert.strictEqual(r2.peak.count, 1);
+
+  const data3 = mkData(['剑', '扇', '灯'], [
+    rec('p0', 1, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', '李四'),
+    rec('p0', 5, '李四', '王五'),
+    rec('p0', 5, '王五', '赵六'),
+    rec('p0', 5, '王五', '钱七'),
+    rec('p1', 3, WAREHOUSE, '张三'),
+    rec('p1', 3, '张三', WAREHOUSE), // 同分钟完整链：张三接、交各一次
+    rec('p2', 4, WAREHOUSE, '张三'),
+  ]);
+  const r3 = investigateBusyWindow(data3, '张三', 3, 3, 3, 1);
+  // s=3 [3,6)：完整确定记录为扇@3 两次 + 灯@4 一次 = 3 > 1（剑@5 的部分链不计）；
+  // 窗口覆盖剑的冲突分钟 5 -> 仍确定超限，段内标注冲突道具
+  assert.strictEqual(r3.undeterminedSegments.length, 0);
+  assert.strictEqual(r3.overSegments.length, 1);
+  const seg = r3.overSegments[0];
+  assert.deepStrictEqual([seg.firstStart, seg.lastStart, seg.peakKnownCount], [3, 3, 3]);
+  assert.deepStrictEqual(seg.records.map((x) => [x.propName, x.minute]), [
+    ['扇', 3],
+    ['扇', 3],
+    ['灯', 4],
+  ]);
+  assert.deepStrictEqual(
+    seg.conflicts.map((c) => [c.propName, c.conflictMinute]),
+    [['剑', 5]]
+  );
+  assert.strictEqual(r3.peak.count, 3);
+  assert.deepStrictEqual(
+    r3.involvedRecords.map((x) => [x.propName, x.minute, x.role]),
+    [['扇', 3, 'to'], ['扇', 3, 'from'], ['灯', 4, 'to']]
+  );
+});
+
+// 15. 同一分钟先有可接续交接、随后才断链：冲突当分钟记录同样不计入已知
+test('忙时排查：同分钟先可接续后断链，冲突当分钟记录不计入已知', () => {
+  const data = mkData(['灯'], [
+    rec('p0', 2, WAREHOUSE, '王五'),
+    rec('p0', 5, '王五', '钱七'),  // 先可接续：王五 -> 钱七
+    rec('p0', 5, '赵六', '孙七'),  // 剩余记录交出者是赵六，无法接续 -> 断链@5
+  ]);
+  const r = investigateBusyWindow(data, '王五', 0, 6, 3, 0);
+  // 王五已知仅第 2 分钟；第5分钟的交出虽在链上但该分钟不完整，不计入
+  // s=0 [0,3):{2}=1 超限；s=1 [1,4):{2}=1 超限；s=2 [2,5):{2}=1 超限（末端 5 不含冲突分钟）；
+  // s=3 [3,6):0 覆盖冲突分钟 -> 无法判定；s=4..6 同样无法判定
+  assert.strictEqual(r.overSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.overSegments[0].firstStart, r.overSegments[0].lastStart, r.overSegments[0].peakKnownCount],
+    [0, 2, 1]
+  );
+  assert.deepStrictEqual(r.overSegments[0].records.map((x) => x.minute), [2]);
+  assert.strictEqual(r.undeterminedSegments.length, 1);
+  assert.deepStrictEqual(
+    [r.undeterminedSegments[0].firstStart, r.undeterminedSegments[0].lastStart],
+    [3, 6]
+  );
+  assert.deepStrictEqual(
+    r.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['灯', 5, 'BROKEN']]
+  );
+  assert.strictEqual(r.peak.count, 1);
+  assert.deepStrictEqual(r.peak.segments, [{ firstStart: 0, lastStart: 2 }]);
+});
+
 console.log(`\n全部 ${passed} 个交接忙时排查引擎测试通过 ✔`);
